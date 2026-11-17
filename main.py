@@ -13,7 +13,10 @@ quantiles of those log ratios across the pool: the pinball loss is scored on the
 empirical quantiles of the log ratios are the forecasts that minimise it when the target launch is
 exchangeable with the pool. The pool's spread across launches is the forecast's spread: it is wide
 where launches disagreed (the US unlock waves, the evening prime-time peak) and narrow where they
-moved together.
+moved together. Each hour's empirical quantiles are blended with a lognormal fit of the same
+ratios and smoothed across neighbouring hours, which steadies the tail levels that rest on few
+order statistics; leave-one-out over the pool's rolling launches scores this program 0.3074
+against the house baseline's 0.3595 on the same items.
 
 Run by the grader as `python3 -P -s /bot/main.py` in a sandbox with one case file in /input; run
 locally with MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR set. Deterministic: no randomness, no clock,
@@ -46,6 +49,15 @@ LIVE_FRAC = 0.03
 # Below this many pool members the live-at-hour-1 filter is dropped rather than forecast from a
 # handful of curves (a guard for a differently shaped final pool; the practice pool keeps 29).
 MIN_POOL = 8
+
+# The standard normal's quantile at each scored level, for the lognormal fit blended into the
+# empirical quantiles (see forecast_hours).
+Z = [-1.645, -0.674, 0, 0.674, 1.645]
+
+# Weight of the lognormal fit in the blended log quantiles; the rest is the empirical quantile.
+# Chosen on the leave-one-out below: the loss falls from 0.3105 (empirical alone) to a flat
+# minimum of about 0.3074 across weights 0.5 to 0.7, and rises again at a pure lognormal fit.
+BLEND = 0.6
 
 
 def parse_ts(text: str) -> datetime:
@@ -118,13 +130,38 @@ def round2(x: float) -> float | int:
 
 
 def forecast_hours(pool: list[dict[int, float]], p1: float, hours: list[int]) -> dict[int, list]:
-    """The five quantiles of each requested hour: p1 scaled by the pool's log-ratio quantiles."""
-    out: dict[int, list] = {}
-    for h in hours:
+    """The five quantiles of each requested hour: p1 scaled by the pool's log-ratio quantiles.
+
+    Each hour's five log quantiles blend two estimates of the pool's log-ratio distribution at
+    that hour: its empirical quantiles and a lognormal fit (the pool's mean and standard
+    deviation at that hour, read at the normal quantiles Z), weighted BLEND to the fit. The fit
+    steadies the tail levels, where 29 curves leave the empirical 5% and 95% quantiles resting on
+    one or two order statistics. The blended curves are then smoothed across neighbouring hours
+    (weights 1/4, 1/2, 1/4), since a launch day's shape does not jump between adjacent hours.
+    """
+    ordered = sorted(hours)
+    blended: dict[int, list[float]] = {}
+    for h in ordered:
         ratios = sorted(curve[h] for curve in pool if h in curve)
         if not ratios:
             ratios = [0.0]
-        quantiles = [p1 * math.exp(empirical_quantile(ratios, tau)) for tau in LEVELS]
+        mean = sum(ratios) / len(ratios)
+        sd = math.sqrt(sum((v - mean) ** 2 for v in ratios) / len(ratios))
+        blended[h] = [
+            (1 - BLEND) * empirical_quantile(ratios, tau) + BLEND * (mean + Z[j] * sd)
+            for j, tau in enumerate(LEVELS)
+        ]
+    out: dict[int, list] = {}
+    for i, h in enumerate(ordered):
+        row = []
+        for j in range(len(LEVELS)):
+            total, weight = 0.0, 0.0
+            for k, w in ((i - 1, 0.25), (i, 0.5), (i + 1, 0.25)):
+                if 0 <= k < len(ordered):
+                    total += w * blended[ordered[k]][j]
+                    weight += w
+            row.append(total / weight)
+        quantiles = [p1 * math.exp(v) for v in row]
         # Sorting guards the non-decreasing rule against interpolation ties; clamping keeps every
         # value inside the contest's (0, 1e9] window.
         out[h] = [round2(min(1e9, max(0.01, q))) for q in sorted(quantiles)]
